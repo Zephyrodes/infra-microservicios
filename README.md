@@ -9,7 +9,7 @@ Plataforma de microservicios estilo producción desplegada sobre Amazon EKS, con
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Jenkins (EC2)                                              │
-│  git push → build → ECR push → kubectl set image           │
+│  git push → build → ECR push → kubectl set image            │
 └──────────────────────────┬──────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────┐
@@ -21,7 +21,7 @@ Plataforma de microservicios estilo producción desplegada sobre Amazon EKS, con
 │  │  Puerto 3000     │     │  Métricas en puerto 9091     │  │
 │  │  /api/tasks      │     │  Procesador en segundo plano │  │
 │  └────────┬─────────┘     └──────────────┬───────────────┘  │
-│           │ ClusterIP                    │ ClusterIP         │
+│           │ ClusterIP                    │ ClusterIP        │
 │           └──────────────┬───────────────┘                  │
 │                          │                                  │
 │  ┌───────────────────────▼─────────────────────────────┐    │
