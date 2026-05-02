@@ -1,0 +1,134 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sre-alerts
+  namespace: default
+  labels:
+    release: monitoring          # coincide con el ruleSelector del Prometheus Operator
+spec:
+  groups:
+
+    # ── Alertas SLO del API Service ────────────────────────────────────────
+    - name: api-service.slo
+      interval: 30s
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m])) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: "Tasa de errores de la API por encima del SLO del 5%"
+            description: "La tasa de errores es {{ $value | humanizePercentage }} en los últimos 5 minutos."
+            runbook: "https://wiki.internal/runbooks/api-high-error-rate"
+
+        - alert: HighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route)
+            ) > 1.0
+          for: 3m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "La latencia P99 supera 1s en {{ $labels.route }}"
+            description: "La latencia P99 es {{ $value | humanizeDuration }} para la ruta {{ $labels.route }}."
+
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="default"}[15m]) * 60 > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: "El pod {{ $labels.pod }} está en crash-loop"
+            description: "El contenedor {{ $labels.container }} en el pod {{ $labels.pod }} se reinició más de una vez en 15 minutos."
+
+        - alert: APIServiceDown
+          expr: |
+            absent(up{job="api-service"}) or sum(up{job="api-service"}) == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: "El servicio API no tiene pods saludables"
+            description: "Ningún pod de api-service está reportando estado UP en Prometheus."
+
+    # ── Alertas del Worker ─────────────────────────────────────────────────
+    - name: worker.slo
+      interval: 30s
+      rules:
+        - alert: WorkerHighErrorRate
+          expr: |
+            sum(rate(worker_errors_total[5m])) > 0.1
+          for: 3m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "La tasa de errores del worker es elevada"
+            description: "El worker está generando {{ $value | humanize }} errores/seg."
+
+        - alert: WorkerQueueDepthHigh
+          expr: worker_queue_depth > 50
+          for: 5m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "La profundidad de la cola del worker es {{ $value }}"
+            description: "La cola ha estado por encima de 50 durante 5 minutos. Considera escalar los workers."
+
+    # ── Alertas de Infraestructura ─────────────────────────────────────────
+    - name: infra
+      interval: 60s
+      rules:
+        - alert: NodeHighCPU
+          expr: |
+            100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+          for: 5m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "Nodo {{ $labels.instance }} con CPU > 80%"
+
+        - alert: NodeHighMemory
+          expr: |
+            (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+            / node_memory_MemTotal_bytes * 100 > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "Nodo {{ $labels.instance }} con memoria > 85%"
+
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace="default"} == 1
+          for: 0m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: "El pod {{ $labels.pod }} fue terminado por OOM"
+            description: "El contenedor {{ $labels.container }} fue terminado por límite de memoria."
+
+        - alert: DeploymentReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{namespace="default"}
+            != kube_deployment_status_available_replicas{namespace="default"}
+          for: 3m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: "El deployment {{ $labels.deployment }} tiene discrepancia de réplicas"

@@ -1,0 +1,80 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE INGRESS
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ENTORNO RESTRINGIDO (configuración actual – sin controlador ALB / OIDC):
+#   Este archivo se proporciona solo como referencia. En un clúster EKS restringido
+#   sin el AWS Load Balancer Controller, los objetos Ingress de clase "alb"
+#   permanecerán sin reconciliar (sin ADDRESS asignada).
+#
+#   ALTERNATIVAS DE ACCESO en entornos restringidos:
+#
+#   1. Port-Forward (acceso local):
+#      kubectl port-forward svc/api-service 8080:80
+#      curl http://localhost:8080/api/tasks
+#
+#   2. NodePort (si el SG del nodo lo permite):
+#      Cambia el tipo del servicio en service.yaml a NodePort, accede vía <node-ip>:<node-port>
+#
+#   3. ClusterIP + kubectl proxy:
+#      kubectl proxy &
+#      curl http://localhost:8001/api/v1/namespaces/default/services/api-service/proxy/api/tasks
+#
+#   4. Ejecutar dentro de un pod en el clúster:
+#      kubectl run -it --rm curl --image=curlimages/curl -- sh
+#      curl http://api-service/api/tasks
+#
+# ENTORNO CON PRIVILEGIOS COMPLETOS (producción con IRSA + OIDC + controlador ALB):
+#   Prerrequisitos:
+#     1. Proveedor OIDC asociado al clúster EKS
+#     2. Rol IAM con AWSLoadBalancerControllerIAMPolicy adjunta (ver iam_policy.json)
+#     3. ServiceAccount IRSA: aws-load-balancer-controller en kube-system
+#     4. Instalación vía Helm: aws-load-balancer-controller
+#        helm repo add eks https://aws.github.io/eks-charts
+#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#          -n kube-system \
+#          --set clusterName=<CLUSTER_NAME> \
+#          --set serviceAccount.create=false \
+#          --set serviceAccount.name=aws-load-balancer-controller
+#   Luego aplica este Ingress – se aprovisionará automáticamente un ALB.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-service-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing          # o "internal"
+    alb.ingress.kubernetes.io/target-type: ip                 # recomendado para Fargate/VPC-CNI
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<account>:certificate/<id>
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/load-balancer-attributes: >
+      routing.http2.enabled=true,
+      access_logs.s3.enabled=false,
+      idle_timeout.timeout_seconds=60
+spec:
+  rules:
+    - host: api.example.internal
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  name: http
+          - path: /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: api-service
+                port:
+                  name: http

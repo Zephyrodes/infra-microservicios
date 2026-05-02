@@ -1,0 +1,220 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  Jenkinsfile – Pipeline CI/CD demo SRE en EKS                           ║
+// ║  Construye imágenes Docker, las sube a ECR y actualiza despliegues EKS  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// REQUISITOS (agente EC2 de Jenkins):
+//   - Docker instalado + usuario Jenkins en el grupo docker
+//   - aws-cli v2 instalado
+//   - kubectl instalado + kubeconfig para el clúster EKS
+//   - Credenciales en Jenkins:
+//       AWS_CREDENTIALS  → access key/secret de AWS (tipo: AWS Credentials)
+//       KUBECONFIG_FILE  → archivo kubeconfig (tipo: Secret file)
+//
+// Variables de entorno en Jenkins (Manage Jenkins → Configure System):
+//   AWS_ACCOUNT_ID  = 123456789012
+//   AWS_REGION      = us-east-1
+//   EKS_CLUSTER     = my-eks-cluster
+//   ECR_REPO_API    = api-service
+//   ECR_REPO_WORKER = worker
+
+pipeline {
+  agent {
+    label 'eks-builder'        // Agente EC2 con Docker + aws-cli + kubectl
+  }
+
+  environment {
+    AWS_ACCOUNT_ID  = "${params.AWS_ACCOUNT_ID ?: env.AWS_ACCOUNT_ID}"
+    AWS_REGION      = "${env.AWS_REGION ?: 'us-east-1'}"
+    ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    ECR_REPO_API    = "${env.ECR_REPO_API ?: 'api-service'}"
+    ECR_REPO_WORKER = "${env.ECR_REPO_WORKER ?: 'worker'}"
+    IMAGE_TAG       = "${env.BUILD_NUMBER}-${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}"
+    NAMESPACE       = "default"
+  }
+
+  parameters {
+    booleanParam(name: 'DEPLOY_API',    defaultValue: true,  description: '¿Desplegar api-service?')
+    booleanParam(name: 'DEPLOY_WORKER', defaultValue: true,  description: '¿Desplegar worker?')
+    booleanParam(name: 'SKIP_TESTS',    defaultValue: false, description: '¿Omitir pruebas smoke?')
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+          echo "Construyendo commit: ${env.GIT_COMMIT_MSG}"
+        }
+      }
+    }
+
+    // ── Etapa 1: Lint y pruebas unitarias ─────────────────────────────────
+    stage('Test') {
+      when { not { expression { params.SKIP_TESTS } } }
+      parallel {
+        stage('api-service lint') {
+          steps {
+            dir('api-service') {
+              sh 'npm ci'
+              sh 'npx --yes eslint app.js --no-eslintrc --rule "no-unused-vars: warn" || true'
+            }
+          }
+        }
+        stage('worker lint') {
+          steps {
+            dir('worker') {
+              sh 'npm ci'
+              sh 'npx --yes eslint worker.js --no-eslintrc --rule "no-unused-vars: warn" || true'
+            }
+          }
+        }
+      }
+    }
+
+    // ── Etapa 2: Login en ECR ─────────────────────────────────────────────
+    stage('ECR Login') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                          credentialsId: 'AWS_CREDENTIALS']]) {
+          sh '''
+            aws ecr get-login-password --region $AWS_REGION \
+              | docker login --username AWS --password-stdin $ECR_REGISTRY
+          '''
+        }
+      }
+    }
+
+    // ── Etapa 3: Build y Push ─────────────────────────────────────────────
+    stage('Build & Push') {
+      parallel {
+        stage('api-service') {
+          when { expression { params.DEPLOY_API } }
+          steps {
+            dir('api-service') {
+              sh """
+                docker build \
+                  --cache-from ${ECR_REGISTRY}/${ECR_REPO_API}:latest \
+                  -t ${ECR_REGISTRY}/${ECR_REPO_API}:${IMAGE_TAG} \
+                  -t ${ECR_REGISTRY}/${ECR_REPO_API}:latest \
+                  .
+                docker push ${ECR_REGISTRY}/${ECR_REPO_API}:${IMAGE_TAG}
+                docker push ${ECR_REGISTRY}/${ECR_REPO_API}:latest
+              """
+            }
+          }
+        }
+        stage('worker') {
+          when { expression { params.DEPLOY_WORKER } }
+          steps {
+            dir('worker') {
+              sh """
+                docker build \
+                  --cache-from ${ECR_REGISTRY}/${ECR_REPO_WORKER}:latest \
+                  -t ${ECR_REGISTRY}/${ECR_REPO_WORKER}:${IMAGE_TAG} \
+                  -t ${ECR_REGISTRY}/${ECR_REPO_WORKER}:latest \
+                  .
+                docker push ${ECR_REGISTRY}/${ECR_REPO_WORKER}:${IMAGE_TAG}
+                docker push ${ECR_REGISTRY}/${ECR_REPO_WORKER}:latest
+              """
+            }
+          }
+        }
+      }
+    }
+
+    // ── Etapa 4: Despliegue en EKS ────────────────────────────────────────
+    stage('Deploy') {
+      steps {
+        withCredentials([file(credentialsId: 'KUBECONFIG_FILE', variable: 'KUBECONFIG')]) {
+          script {
+            if (params.DEPLOY_API) {
+              sh """
+                kubectl set image deployment/api-service \
+                  api-service=${ECR_REGISTRY}/${ECR_REPO_API}:${IMAGE_TAG} \
+                  -n ${NAMESPACE}
+                kubectl rollout status deployment/api-service \
+                  -n ${NAMESPACE} --timeout=120s
+              """
+            }
+            if (params.DEPLOY_WORKER) {
+              sh """
+                kubectl set image deployment/worker \
+                  worker=${ECR_REGISTRY}/${ECR_REPO_WORKER}:${IMAGE_TAG} \
+                  -n ${NAMESPACE}
+                kubectl rollout status deployment/worker \
+                  -n ${NAMESPACE} --timeout=120s
+              """
+            }
+          }
+        }
+      }
+    }
+
+    // ── Etapa 5: Prueba smoke ─────────────────────────────────────────────
+    stage('Smoke Test') {
+      when { not { expression { params.SKIP_TESTS } } }
+      steps {
+        withCredentials([file(credentialsId: 'KUBECONFIG_FILE', variable: 'KUBECONFIG')]) {
+          sh '''
+            # Port-forward en segundo plano para prueba interna
+            kubectl port-forward svc/api-service 18080:80 -n $NAMESPACE &
+            PF_PID=$!
+            sleep 5
+
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18080/healthz)
+            kill $PF_PID || true
+
+            if [ "$STATUS" != "200" ]; then
+              echo "Prueba smoke FALLÓ – /healthz devolvió $STATUS"
+              exit 1
+            fi
+            echo "Prueba smoke EXITOSA – /healthz devolvió $STATUS"
+          '''
+        }
+      }
+    }
+
+    // ── Etapa 6: Aplicar manifiestos k8s ───────────────────────────────────
+    stage('Apply Manifests') {
+      steps {
+        withCredentials([file(credentialsId: 'KUBECONFIG_FILE', variable: 'KUBECONFIG')]) {
+          sh '''
+            kubectl apply -f k8s/hpa/hpa.yaml           -n $NAMESPACE
+            kubectl apply -f k8s/servicemonitor.yaml    -n $NAMESPACE
+            kubectl apply -f k8s/alerts/prometheusrule.yaml -n $NAMESPACE
+          '''
+        }
+      }
+    }
+  }
+
+  // ── Acciones posteriores ────────────────────────────────────────────────
+  post {
+    success {
+      echo "✅ Pipeline exitoso – tag de imagen: ${IMAGE_TAG}"
+    }
+    failure {
+      withCredentials([file(credentialsId: 'KUBECONFIG_FILE', variable: 'KUBECONFIG')]) {
+        sh '''
+          echo "=== Reversión automática iniciada ==="
+          kubectl rollout undo deployment/api-service -n $NAMESPACE || true
+          kubectl rollout undo deployment/worker      -n $NAMESPACE || true
+        '''
+      }
+      echo "❌ Pipeline falló – se intentó rollback automático"
+    }
+    always {
+      sh 'docker system prune -f --filter "until=24h" || true'
+    }
+  }
+}

@@ -1,0 +1,35 @@
+# ServiceMonitor para api-service
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-service-monitor
+  namespace: default
+  labels:
+    release: monitoring          # debe coincidir con el serviceMonitorSelector del Prometheus Operator
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+# ServiceMonitor para worker
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: worker-monitor
+  namespace: default
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: worker
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
